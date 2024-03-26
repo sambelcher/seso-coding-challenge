@@ -8,9 +8,10 @@ const {
 
 /**
  * Bottleneck - waiting for each individual log to resolve from popAsync every time.
+ * Processing multiple logs from each logSource using promise.all() didn't work - we would get the same results for each resolved promise.
  *
- * for example, if we process N (we can adjust value of N to control whether we care more about time or space) entries at once for a logSource - when we go
- * to print the nextLog, we don't always have to wait for another popAsync, if there is still anothe entry from that logSource in our queue
+ * This solution, instead, pops a new log from every non-drained logSource, every time we need a new one. This means we don't always
+ * We only pop logs, when the most recently consumed log from the queue has no more logs in the queue
  * - pop first log from each source at same time - this could be increased potentially as well to grab more than the first log.
  * - each time we run out of logs from a logSource in the queue, we pop N logs
  * - the next N times we check that logSource, we can just pull directly from the priority queue instead
@@ -19,16 +20,14 @@ const {
  *    - if counts[currentLogSource] <= 0, pop off N more logs, otherwise grab from the priorityqueue
  */
 
-// this constant can be adjusted to any number we want, depending on if we are prioritizing space or time
-// higher limit => faster processing, but potentially more space used since more entries may be stored in the priority queue
-// We could use logSources.length instead, to ensure we process results faster, as the input size gets bigger? This would also increase space used as input size got bigger though.
-const NUMBER_OF_LOGS_TO_PROCESS_AT_ONCE = 2;
-
 module.exports = async (logSources, printer) => {
 
   // initialize priority queue with date as the comparator
   const recentLogsQueue = new MinPriorityQueue(logAndIndex => logAndIndex.log.date);
+  // used to check if a given logSource still has logs in the queue
   const logsInQueueForLogSource = Array(logSources.length).fill(0);
+  // used to check if a given logSource is drained
+  const logsDrained = Array(logSources.length).fill(false);
 
   // get first log from each logSource
   const promises = logSources.map((logSource) => {
@@ -43,28 +42,30 @@ module.exports = async (logSources, printer) => {
     });
   });
 
-  // Process next log in queue, and replace with next log from that logSource
+  // Process next log in queue, and replace with next logs from that logSource if needed
   while (!recentLogsQueue.isEmpty()) {
-    const logAndIndex = recentLogsQueue.dequeue();
-    logsInQueueForLogSource[logAndIndex.logSourceIndex] -= 1;
-    printer.print(logAndIndex.log)
+    const {logSourceIndex, log} = recentLogsQueue.dequeue();
+    logsInQueueForLogSource[logSourceIndex] -= 1;
+    printer.print(log)
 
     // only need to pop more logs if this logSource has 0 logs in the queue
-    if (logsInQueueForLogSource[logAndIndex.logSourceIndex] <= 0) {
-      // get next log from logSource, and add to queue if not drained
-      const logSource = logSources[logAndIndex.logSourceIndex];
-      const promises = []
+    if (logsInQueueForLogSource[logSourceIndex] <= 0) {
 
-      for (let i = 0; i < NUMBER_OF_LOGS_TO_PROCESS_AT_ONCE; i++) {
-        promises.push(logSource.popAsync());
-      }
+      // get next log from each logSource
+      const promises = logSources.map((logSource, idx) => {
+        if (!logsDrained[idx]) {
+          return logSource.popAsync();
+        }
+      });
 
-      // resolve all of the first logs at same time
+      // resolve all of the popped logs at same time
       await Promise.all(promises).then((data) => {
-        data.forEach((log) => {
-          if (log) {
-            logsInQueueForLogSource[logAndIndex.logSourceIndex] += 1;
-            recentLogsQueue.enqueue({ logSourceIndex: logAndIndex.logSourceIndex, log });
+        data.forEach((resolvedLog, idx) => {
+          if (resolvedLog) {
+            logsInQueueForLogSource[idx] += 1;
+            recentLogsQueue.enqueue({ logSourceIndex: idx, log: resolvedLog });
+          } else {
+            logsDrained[idx] = true;
           }
         });
       });
